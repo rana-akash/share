@@ -1,0 +1,24 @@
+Yes—there are useful insights here. **I would give H4/UART synchronization loss higher priority, but the response from second agent overstate how much has been proved.** I compared them with the handoff and checked the relevant specification and driver sources.
+
+The strongest points are:
+
+- **Check outgoing SCO after the first error.** Our handoff reports prolonged incoming SCO, but not whether outgoing audio continued alongside failed resets. That is the best immediate question to answer using existing captures.
+- **Use repeated runs when comparing configurations.** Failure times vary substantially. A single run cannot establish whether a change improves reliability.
+- **The USB gadget remains a possible contributor.** Stopping the gateway did not remove its kernel driver or USB activity. The handoff already acknowledges this.
+
+Several claims need correcting:
+
+|  claim | My assessment |
+|---|---|
+| Hardware Error `0x00` proves H4 parser desynchronization | **A strong hypothesis, not established for this firmware.** Infineon says this code usually reflects failure to recognize a UART packet indicator. The specification requires a Hardware Error event for synchronization loss; that does not prove every such event has that cause. [Infineon explanation](https://community.infineon.com/t5/AIROC-Bluetooth/Murata-MW1-Cypress-CYW43455-bt-firmware-chrashes-when-chip-is-in-LPM-low-power/td-p/341403) |
+| Each error represents one rejected byte; SCO swallowed all 825 resets | **Unverified controller-internal behavior.** The specification says Reset is used to regain synchronization. It does not describe that byte-by-byte algorithm or establish that continued SCO necessarily prevents recovery. [UART specification](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-61/out/en/host-controller-interface/uart-transport-layer.html) |
+| Probing `uart_write` would newly expose short writes missed earlier | **Mostly redundant for return lengths.** `ttyport_write_buf` directly returns the underlying TTY write result. In this serial path, that is `uart_write`. The existing probe already observes that return value indirectly. Monitoring termios changes would be a separate, potentially useful measurement. [TTY wrapper](https://raw.githubusercontent.com/raspberrypi/linux/rpi-6.18.y/drivers/tty/serdev/serdev-ttyport.c), [serial implementation](https://raw.githubusercontent.com/raspberrypi/linux/rpi-6.18.y/drivers/tty/serial/serial_core.c) |
+| “Lowering baud did not resolve the issue” is unsupported | **Our statement is valid:** it failed again at 1 Mbaud. What remains unknown is whether lowering baud changes the failure probability or typical failure time. |
+| A successful A2DP soak rules out UART integrity | **Too strong.** Different packet sizes, timing, directionality, and controller workloads make it a useful comparison, but not an exclusion test for every UART fault. |
+| Wi-Fi load isolates radio coexistence | **It does not isolate it completely.** Added traffic also changes host CPU, interrupt, and SDIO activity. A difference would implicate Wi-Fi-related activity broadly. |
+
+The sleep-mode observation is useful: the inspected driver enables its sleep configuration only after successfully requesting the wake IRQ, and the board file adds only a shutdown GPIO to the Bluetooth node. That supports deprioritizing **that specific host-controlled sleep mechanism**, subject to checking the running device tree. It does not exclude every internal controller power behavior. [Driver](https://raw.githubusercontent.com/raspberrypi/linux/rpi-6.18.y/drivers/bluetooth/hci_bcm.c), [board definition](https://raw.githubusercontent.com/raspberrypi/linux/rpi-6.18.y/arch/arm/boot/dts/broadcom/bcm2837-rpi-zero-2-w.dts)
+
+**My recommended next step is narrowly scoped:** inspect `direct-msbc.btsnoop` and the second UART capture for outgoing SCO, its last timestamp, and subsequent unanswered resets. If resets kept failing long after outgoing SCO stopped, the second agent “ongoing audio prevents resynchronization” explanation becomes substantially weaker.
+
+I haven’t changed files, run experiments, or accessed the Pi. Any implementation would first need the short plan and approval required by your `AGENTS.md`.
