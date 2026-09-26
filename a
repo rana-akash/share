@@ -1,0 +1,733 @@
+# Pi Audio Gateway: Bluetooth controller failure investigation
+
+Prepared 2026-09-26. All wall-clock times below are IST (UTC+05:30), unless explicitly marked otherwise.
+
+This is a self-contained handoff for reviewers who have **no repository or Pi access**. Relevant implementation and diagnostic scripts are included below. Credentials are intentionally omitted. Raw Bluetooth captures remain on the Pi; this document contains their measured results, not audio payloads.
+
+## 1. Objective and current conclusion
+
+The user wants a reliable USB-to-Bluetooth audio gateway with simultaneous headset playback and microphone capture. They want the **root cause investigated**, not an automatic controller-reset/recovery script.
+
+**The exact underlying cause has NOT been established.** We have repeatedly captured Bluetooth HCI Hardware Error events with code `0x00`, followed by HCI Reset timeouts. This occurs with the gateway running and with the gateway stopped during direct Pi playback/capture.
+
+Temporary kernel probes showed complete acceptance of writes by the Linux Bluetooth-to-serial and serial-to-TTY interfaces immediately before failures. This rules out observed short writes at those interfaces in the captured windows. It does **not** prove that the UART hardware transmitted every byte correctly or that the controller received/processed every byte correctly.
+
+The remaining area of interest is UART transmission beyond software buffering, controller UART reception/parser behavior, or controller firmware. These are hypotheses, not a diagnosis of physically damaged hardware. Firmware/radio coexistence and other triggers have not been eliminated.
+
+## 2. User preferences and boundaries
+
+- Find the cause; do not substitute a recovery loop for diagnosis.
+- Present a short plan and obtain approval before code/configuration changes. Keep changes minimal.
+- The user declined a CVSD comparison and specifically requested diagnosis of the hardware error. All tests so far used mSBC.
+- For tests lasting minutes, set them up on the Pi, then let the user monitor sound and report when it stops. Do not spend the conversation polling throughout a long test.
+- Keep the gateway stopped during isolated tests. Do not automatically restart it at the end of future tests.
+- Prevent test streams from falling back to USB audio when Bluetooth disappears.
+
+## 3. Hardware, OS, and software
+
+| Item | Observed value |
+|---|---|
+| Board | Raspberry Pi Zero 2 W Rev 1.0 |
+| OS | Debian GNU/Linux 13 (trixie), Raspberry Pi packages; `/etc/os-release` reported Debian 13.7 |
+| Kernel in every completed test | `6.18.50+rpt-rpi-v8`, aarch64, package `1:6.18.50-1+rpt1`, build dated 2026-09-11 |
+| Headset | OnePlus Bullets Wireless Z2 |
+| Headset address | `84:0F:2A:DE:A0:D1` |
+| Bluetooth controller | Onboard Broadcom; kernel identifies `BCM43430B0`, chip ID 115 |
+| Controller interface | UART, Linux `hci0`; PL011 `ttyAMA1` at `0x3F201000` |
+| Driver/device | `hci_uart_bcm`, serial device `serial0-0` |
+| Controller firmware | `BCM43430B0 (002.001.012) build 0092` |
+| Firmware string | `BCM4343B0 37.4MHz wlbga_iLNA_iTR [Baseline: 0092]` |
+| Firmware requested | `brcm/BCM43430B0.raspberrypi,model-zero-2-w.hcd` |
+| Firmware symlink target | `../synaptics/SYN43430B0.hcd` |
+| `bluez-firmware` | `1.2-13+rpt2` |
+| `firmware-brcm80211` | `1:20260519-1~bpo13+1+rpt1` |
+| BlueZ | `5.82-1.1+rpt2` |
+| PipeWire | `1.4.2-1+rpt3` |
+| WirePlumber | `0.5.8-2` |
+| Host | Mac connected to the Pi's USB audio gadget |
+
+Both `/lib/firmware/brcm/BCM43430B0.hcd` and `/lib/firmware/synaptics/SYN43430B0.hcd` had SHA-256:
+
+```text
+338c2c6631131f516bfc7e64ef0872bd0402e1f98ef9d0c900eef0c814d90a25
+```
+
+`dpkg -V bluez-firmware` produced no differences. This checks installed files against package metadata; it does not establish that the firmware is bug-free or optimal.
+
+`hciconfig -a` reported:
+
+```text
+Type: Primary  Bus: UART
+ACL MTU: 1021:7  SCO MTU: 64:1
+HCI Version: 4.2 (0x8)  Revision: 0x5c
+LMP Version: 4.2 (0x8)  Subversion: 0x410c
+Manufacturer: Broadcom Corporation (15)
+```
+
+Wi-Fi remained enabled throughout the completed tests. It was connected on 2472 MHz (2.4 GHz), with power saving enabled and a sampled signal around -57 dBm. Wi-Fi-off and Wi-Fi-power-save-off comparisons have **not** been performed.
+
+## 4. Normal audio architecture
+
+```text
+Mac playback
+  -> USB UAC2 gadget capture on Pi (48 kHz, S16, stereo)
+  -> PipeWire pw-loopback (stereo to mono)
+  -> Bluetooth HFP AG / mSBC (16 kHz, mono)
+  -> headset speaker
+
+Headset microphone
+  -> Bluetooth HFP AG / mSBC source (16 kHz, mono)
+  -> PipeWire pw-loopback
+  -> USB UAC2 gadget playback on Pi (48 kHz, S16, mono)
+  -> Mac microphone input
+```
+
+Stable PipeWire node names:
+
+```text
+pi_gateway_host_audio
+pi_gateway_usb_microphone
+bluez_output.84_0F_2A_DE_A0_D1.1
+bluez_input.84_0F_2A_DE_A0_D1.0
+```
+
+The Mac labels the USB input “Capture Inactive.” The user watches the input-level bars there. That label alone is not proof of Bluetooth state.
+
+The gateway polls `pw-dump` once a second, selects the available mSBC profile, and maintains two `pw-loopback` processes. It reconnects when the headset device is absent, at 15-second intervals. Its printed `True` route status means nodes/processes exist, not that sound is audibly reaching the headset.
+
+The normal gateway already sets `node.dont-fallback=true` on its loopback streams. The fallback mistake discussed below was in the **first diagnostic test**, not in this gateway setting.
+
+USB gadget settings from the project:
+
+| Setting | Value |
+|---|---|
+| Gadget | Configfs `pi-audio-gateway`, `uac2.usb0` |
+| `c_chmask`, `c_srate`, `c_ssize` | `3`, `48000`, `2` |
+| `p_chmask`, `p_srate`, `p_ssize` | `1`, `48000`, `2` |
+| `req_number` | `32` |
+| `c_hs_bint`, `p_hs_bint` | `4`, `4` (1 ms at USB high speed) |
+| USB mute/volume controls | Disabled |
+| USB identity | VID `0x1d6b`, PID `0x0104`; product “Pi Audio Gateway” |
+| `bmAttributes`, `MaxPower` | `0x80`, `500` |
+
+The USB gadget remained physically attached and configured during isolated tests. Stopping the gateway removed its audio bridges, not the USB gadget or its kernel driver. Therefore those tests do not eliminate every possible USB/interrupt/system-load interaction.
+
+## 5. Symptoms and initial observations
+
+- Headset playback works initially, then stops. The user initially reported roughly two minutes or less; observed runs ranged from tens of seconds to about 20 minutes.
+- Microphone response at the Mac also disappears during normal gateway failure.
+- Stopping the gateway and playing a WAV directly to the Bluetooth sink **after failure** also produced no headset sound.
+- Unbinding/rebinding the Bluetooth driver restored operation temporarily.
+- The gateway process remained alive when the controller failed. Kernel Bluetooth errors preceded lost routes and related audio errors.
+
+Representative first-boot sequence, in monotonic seconds since boot:
+
+```text
+[111.196041] Bluetooth: hci0: hardware error 0x00
+[111.200463] bluetoothd: Hands-Free Voice gateway transport endpoint not connected
+[111.256067] pipewire: ALSA follower resync
+[113.280125] Bluetooth: hci0: Opcode 0x0c03 failed: -110
+[113.280392] Bluetooth: hci0: hardware error 0x00
+[115.001901] gateway: Host -> headset: False; headset -> host: False
+[115.328048] Bluetooth: hci0: Opcode 0x0c03 failed: -110
+```
+
+`0x0c03` is HCI Reset; `-110` is timeout. Linux was already trying resets itself. Our later statement that there was no “recovery loop” means no new application-level recovery loop was added; it does not mean the kernel made no recovery attempts.
+
+Some early wall-clock log timestamps were affected by clock synchronization. Use monotonic timestamps when comparing boot-relative events.
+
+## 6. Completed experiments
+
+### A. Original configuration, gateway running, 3,000,000 baud
+
+The user had manually reset the controller before the initial SSH investigation. It initially worked during inspection, then failed again without rebooting.
+
+- Captured failure at approximately 15:39:52 IST, monotonic `1485.292` seconds.
+- Trace showed 39 HCI Hardware Error events, code `0x00`, within 1.428 ms.
+- Incoming SCO audio paused about 144.106 ms before the first error.
+- Last outgoing SCO packet was submitted about 0.892 ms before the error.
+- There were no HCI control commands immediately preceding the failure in that capture; it was ordinary SCO traffic.
+- The first subsequent HCI Reset was about 64 ms after the error; it timed out.
+- Controller subsequently showed `DOWN`.
+
+The reset-to-failure interval in this run was approximately 20 minutes, so this is not exclusively a boot-time or fixed two-minute failure.
+
+### B. Lower UART baud to 1,000,000
+
+Approved change: back up `/boot/firmware/config.txt`, add `dtparam=krnbt_baudrate=1000000`, reboot, and repeat with the gateway running.
+
+- Effective device-tree `max-speed` was verified as `1000000`.
+- User confirmed both audio directions initially worked.
+- Failed again approximately 4 minutes 38 seconds after connected gateway audio began (boot-relative hardware error at `338.100` seconds).
+- Same initial burst of 39 hardware-error events and reset timeouts.
+- Incoming SCO paused about 170.846 ms before the first error.
+- Last outgoing SCO was about 1.346 ms before the error.
+- 548 SCO receive packets were still observed within 10 seconds after the error.
+
+**Result:** lowering baud did not resolve the issue. It does not eliminate every UART-related fault.
+
+The boot configuration was restored from backup and rebooted. All subsequent tests used the original 3,000,000-baud setting.
+
+### C. Direct Pi playback/capture; gateway stopped
+
+The gateway was stopped. A continuous `pw-record` stream captured the headset mic to `/dev/null`. A loop played `/usr/share/sounds/alsa/Front_Center.wav` at volume 0.3, with a two-second pause between plays.
+
+Speaker playback was **repeated short WAV playback**, not one continuous playback process. Microphone capture was continuous. PipeWire, WirePlumber, BlueZ, mSBC, Wi-Fi, the kernel, and the USB gadget remained present.
+
+| Time | Event |
+|---|---|
+| 15:55:28 | Gateway stopped |
+| 15:56:30 | Direct playback/capture test started |
+| **16:12:22.275** | First captured hardware error |
+| 16:39:35 | Inspection confirmed test still running and gateway still stopped |
+| 16:40:09 | Investigator stopped the test; its original cleanup trap restarted the gateway |
+
+The failure occurred **before** the gateway restarted. Gateway execution is therefore not necessary for reproduction in this setup.
+
+Important trace result:
+
+```text
+Hardware Error code: 0x00
+Incoming SCO packets after first error: 220,768
+Time over which incoming SCO continued after error: 27.78 minutes
+HCI Reset commands after first error: 825
+HCI Reset completion events after first error: 0
+```
+
+This is evidence that the controller-to-host data path remained active while command handling/reset failed. It does not prove that these packets contained valid live microphone audio or that the headset speaker continued playing.
+
+#### Confound discovered in this test
+
+The first isolated-test script specified Bluetooth targets but omitted `node.dont-fallback`. After the Bluetooth nodes disappeared, PipeWire selected the remaining USB audio nodes. The live graph explicitly showed the recorder linked to the USB source instead of the headset.
+
+The user observed regular Mac input-meter activity matching the “Front center” playback intervals even though the headset was silent. Playback falling back to the USB microphone sink explains this observation. The input bars were not evidence that the Bluetooth microphone still worked.
+
+This mistake affects interpretation of the post-failure audio routing, but does not erase the Bluetooth hardware-error capture while the gateway was stopped. Later tests explicitly disabled fallback and automatic reconnection, and did not restart the gateway.
+
+### D. Temporary kernel UART tracing, first run
+
+Approved experiment: instrument the UART software interfaces, reset the controller once, repeat direct mSBC playback/capture with strict headset targets, and retain the trace at the first hardware error.
+
+- Gateway stopped throughout.
+- Original 3,000,000 baud, same kernel/firmware/mSBC.
+- `node.dont-fallback=true` and `node.dont-reconnect=true` verified on the capture stream; the same properties were passed to playback.
+- Bluetooth failed during setup verification, at **16:53:01.697 IST**.
+- Kernel trace froze at `hci_hardware_error_evt`, monotonic `3604.564616` seconds.
+- Saved trace covered about 49.94 seconds, including connection setup and the shorter audio portion.
+- 3,812 matched write/return pairs at **each** of the two TX interfaces, all accepted in full.
+- Of these writes, 3,750 requested 64 bytes (60-byte SCO payload + 3-byte SCO header + 1-byte H4 type).
+- 29,012 matched RX entry/return pairs, all accepted in full.
+- No missed probes, no ring-buffer overwrites, and no dropped trace events in this run.
+- The initial 10 ms error burst contained 14 errors; error-burst count is therefore not always 39.
+- Last HCI SCO submission was 2.031 ms before the first error; last received SCO packet was 1.710 ms before it.
+
+Representative final writes in the kernel trace:
+
+```text
+3604.562564  serdev_device_write_buf entry: requested=64
+3604.562662  ttyport_write_buf entry: requested=64
+3604.562697  ttyport_write_buf return: accepted=64
+3604.562702  serdev_device_write_buf return: accepted=64
+
+3604.562713  serdev_device_write_buf entry: requested=64
+3604.562718  ttyport_write_buf entry: requested=64
+3604.562792  ttyport_write_buf return: accepted=64
+3604.562796  serdev_device_write_buf return: accepted=64
+
+3604.564616  hci_hardware_error_evt
+```
+
+### E. Repeat of the same kernel-traced test
+
+Requested by the user before trying another kernel.
+
+- Started **16:57:35 IST**.
+- Failed **16:59:49.287 IST**, approximately **2 minutes 14 seconds** later.
+- Initial burst: 39 HCI Hardware Error events, code `0x00`.
+- Last received SCO packet preceded the error by **855.211 ms**; last outgoing SCO submission by **0.602 ms**.
+- Saved rolling kernel trace spanned about 54.73 seconds overall. Per-CPU buffers retained different starting times; the common window across all CPUs was approximately 48 seconds.
+- 6,713 matched TX write/return pairs at each traced interface in the retained data; **zero size mismatches**.
+- 51,145 matched RX entry/return pairs; zero size mismatches.
+- Three unmatched RX returns occurred at rolling-buffer boundaries.
+- No missed kprobes or reported dropped events. There **were expected ring-buffer overwrites of older history**; this run is not a full trace of the entire test.
+- Gateway remained stopped. Test exited without USB fallback.
+
+Tracing overhead can change scheduling and failure timing. Similar controller errors were already captured without these kernel probes, so the general failure is not unique to instrumentation. Exact failure-time comparisons should not be treated as controlled performance measurements.
+
+## 7. Other measurements and their limits
+
+- `vcgencmd get_throttled` repeatedly returned `0x0`, including after failures. Temperatures sampled around 52–54 °C. No detected undervoltage/throttling; this is not an oscilloscope measurement of the controller supply.
+- `/proc/tty/driver/ttyAMA` showed PL011 TX/RX counters and `RTS|CTS|DTR`, with no reported framing/overrun counters. This is mainly evidence about host-side reception and software accounting, not proof of correct chip-side reception.
+- Pin configuration while failed:
+
+  ```text
+  GPIO30: CTS0, low
+  GPIO31: RTS0, low
+  GPIO32: TXD0, high
+  GPIO33: RXD0, high
+  ```
+
+- UART clock from debugfs: `48000000` Hz. The Bluetooth port is PL011, not the mini UART. `/dev/serial0 -> ttyS0` refers to the separate console mapping and must not be mistaken for the Bluetooth UART.
+- Bluetooth serdev runtime power status: `unsupported`, active/suspended counters both 0. Parent UART runtime state: `active`, suspended time 0 during the inspected boot. No observed host UART runtime-suspend episode.
+- No separate `hciuart.service`, `hciattach`, or `btattach` process was found. Kernel serdev manages this controller.
+- No controller devcoredump was available. Broadcom vendor diagnostics were not enabled (`vendor_diag` read `N`).
+- WirePlumber sometimes logged `spa.bluez5.source.sco: decode failed: -3`, including before failures. The exact meaning/cause was not established. Incoming HCI SCO packet status bits in the examined pre-failure captures were all 0; that does not guarantee successful mSBC decoding.
+- Outgoing HCI SCO packet lengths in the examined captures were consistently 63 bytes, declaring 60 payload bytes. No malformed length fields were observed.
+- There were no measurements of actual physical UART TX bytes, controller-side FIFO contents, or internal firmware state.
+- Wi-Fi stayed enabled; its coexistence/power-save involvement remains untested.
+
+## 8. What the evidence supports—and does not
+
+**Supported:**
+
+1. The failure is below ordinary gateway route management: it reproduces during direct Pi audio while the gateway process is stopped.
+2. HCI hardware-error events precede application route loss. HCI Reset then receives no successful completion.
+3. At least one failed session continued receiving SCO packets for nearly 28 minutes, so describing the entire chip as completely powered off or wholly dead is too strong.
+4. Lowering UART baud from 3 Mbaud to 1 Mbaud did not fix it.
+5. The traced Linux software interfaces accepted all paired writes in the captured windows; no short-write error was found there.
+
+**Not established:**
+
+- Physical UART byte loss, a specific PL011 bug, an H4 synchronization defect, controller firmware parser failure, or defective hardware.
+- That the normal gateway is entirely irrelevant to all possible failure timings. It is simply not necessary for the reproduced failure.
+- That all firmware, kernel, radio/coexistence, power, or headset interoperability causes have been excluded.
+- That changing codec, replacing hardware, or updating/downgrading software will fix it.
+
+Do not equate the generic “hardware error” label with a proven physical hardware defect. Do not equate a successful Linux write return or incremented UART TX counter with verified bytes on the wire.
+
+## 9. State at handoff
+
+- Original 3,000,000-baud configuration restored.
+- Kernel remains `6.18.50+rpt-rpi-v8`. No kernel or firmware package was changed.
+- Gateway service is **stopped/inactive**, but still enabled for normal boot.
+- Isolated playback tests and trace collection services are stopped.
+- Temporary kprobes and their dedicated trace instance were removed after saving each run.
+- Bluetooth was left in its failed state after the final test; no final recovery reset was performed.
+- Production gateway code and WirePlumber configuration were not changed during this investigation.
+- Boot-config backup exists on the Pi at `/boot/firmware/config.txt.before-bt-uart-1000000`.
+- A comparison with `linux-image-6.12.75+rpt-rpi-v8` was proposed, but **not approved/executed**. The Pi's package cache lists it from the official Raspberry Pi repository. `apt-get -s install` simulated adding that one package, with no upgrades/removals. This was a simulation only. A future comparison must preserve the existing boot setup and account for kernel package boot hooks/initramfs selection.
+
+## 10. Questions for an independent reviewer
+
+1. What failure mechanism best explains HCI Hardware Error `0x00`, unanswered resets, and continuing inbound SCO packets?
+2. Are there relevant BCM43430B0/build-0092 or Raspberry Pi PL011/serdev issues that match these specific observations? Please distinguish a matching report from a proven cause.
+3. What is the smallest next measurement that distinguishes host UART/FIFO loss from controller input/parser/firmware failure?
+4. Would a controlled kernel comparison be more informative than additional software tracing at the already-checked interfaces?
+5. Are the repeated bursts of 14/31/39 error events and the pre-error RX gaps meaningful, or potentially artifacts of transport/driver buffering?
+
+Please avoid proposing only recovery scripts, indiscriminate configuration changes, or declaring the cause solved without a discriminating measurement.
+
+## 11. References checked
+
+- [Infineon/Cypress support explanation of Hardware Error code 0 and UART synchronization](https://community.infineon.com/t5/AIROC-Bluetooth/Murata-MW1-Cypress-CYW43455-bt-firmware-chrashes-when-chip-is-in-LPM-low-power/td-p/341403). This concerns a different controller, CYW43455, and supports a hypothesis about UART synchronization—not proof that this BCM43430B0 has the same cause.
+- [Raspberry Pi PL011 fix: “Avoid rare write-when-full error”](https://github.com/raspberrypi/linux/commit/65aa6ec0faaa012508489886ac357cbb86cdb9a4). Historical evidence that a dropped UART TX byte can occur in this family. The inspected current `rpi-6.18.y` source already contains the final-byte FIFO-full check from this fix; do not assume this old fix is missing. The running kernel binary was not disassembled to verify its exact implementation.
+- [Broadcom UART driver source](https://github.com/raspberrypi/linux/blob/rpi-6.18.y/drivers/bluetooth/hci_bcm.c).
+- [Bluetooth serdev source](https://github.com/raspberrypi/linux/blob/rpi-6.18.y/drivers/bluetooth/hci_serdev.c). Its write worker submits the buffer to `serdev_device_write_buf`, advances by the accepted length, and retains a remainder if necessary.
+- [Kernel kprobe-event documentation](https://docs.kernel.org/trace/kprobetrace.html).
+- [BlueZ HCI command documentation identifying Reset as 0x0c03](https://github.com/bluez/bluez/blob/master/doc/bluetoothctl-hci.rst).
+- [Raspberry Pi UART baud parameter documentation](https://github.com/raspberrypi/firmware/blob/master/boot/overlays/README).
+- [Raspberry Pi kernel installation/alternate-kernel documentation](https://www.raspberrypi.com/documentation/computers/linux_kernel.html).
+
+Upstream branch files can change after this handoff. These were read during diagnosis; no upstream patch was applied.
+
+## 12. Evidence files on the Pi
+
+All under `/home/us01/pi-gateway-diagnosis/`:
+
+| Path | Meaning |
+|---|---|
+| `pi-gateway-diagnosis-extended.btsnoop` | Original-baud gateway failure capture |
+| `pi-gateway-diagnosis-extended.txt` | Decoded text of that capture |
+| `pi-gateway-diagnosis-kernel.txt` / `pi-gateway-diagnosis-audio.txt` | Early saved logs |
+| `uart-1000000.btsnoop` / `.txt` | Lower-baud failure capture |
+| `uart-1000000-kernel.txt` | Lower-baud kernel log |
+| `direct-msbc.btsnoop` | First direct-test capture, including post-failure SCO/reset behavior |
+| `direct-msbc-kernel.txt` | Saved late kernel log from that test; earlier journal entries had rotated |
+| `uart-run-1/uart-detail*` | First kernel-traced test |
+| `uart-run-2/uart-detail*` | Repeat kernel-traced test |
+| `pi-uart-trace-setup.py` | Temporary tracing setup script |
+| `pi-uart-trace-save.sh` | Freeze/save watcher |
+| `pi-uart-audio-test.sh` | Corrected headset-only playback/capture test |
+
+Each `uart-detail*` set contains `.btsnoop`, `-trace.txt`, `-probes.txt`, `-buffer-stats.txt`, `-kernel.txt`, and `-counters.txt`.
+
+Raw `.btsnoop` captures can contain audio payloads. They were analysed on the Pi and were not copied to the Mac or embedded here. This handoff does not require reviewers to obtain those files to understand the stated findings.
+
+## 13. Relevant boot and reset details
+
+Relevant active boot settings:
+
+```ini
+arm_64bit=1
+enable_uart=1
+dtoverlay=dwc2,dr_mode=peripheral
+```
+
+No `miniuart-bt` overlay was configured. The baud-test line was removed by restoring the backup. The boot command line included `console=serial0,115200 console=tty1`; the console's `serial0` mapping was separate from Bluetooth's PL011.
+
+Manual reset that restored operation temporarily (shown for reproducibility, not as a proposed permanent solution):
+
+```sh
+sudo sh -c "printf '%s' serial0-0 > /sys/bus/serial/drivers/hci_uart_bcm/unbind"
+sleep 2
+sudo sh -c "printf '%s' serial0-0 > /sys/bus/serial/drivers/hci_uart_bcm/bind"
+sleep 5
+timeout 12 bluetoothctl power on
+timeout 12 bluetoothctl connect 84:0F:2A:DE:A0:D1
+```
+
+## 14. Diagnostic implementation
+
+These are the temporary scripts used in the last two tests. They are included as evidence of exactly what was measured, not as instructions to execute blindly on another machine. The trace setup is not idempotent if its previous probes still exist.
+
+### UART probe setup
+
+```python
+from pathlib import Path
+import os
+
+root = Path('/sys/kernel/tracing')
+inst = root / 'instances/pi_uart'
+inst.mkdir(exist_ok=True)
+(inst / 'tracing_on').write_text('0')
+(inst / 'buffer_size_kb').write_text('1024')  # Per CPU; four CPUs.
+(inst / 'trace_clock').write_text('mono')
+probes = [
+    'p:pi_uart/tx serdev_device_write_buf port=$arg1:x64 requested=$arg3:u64',
+    'r:pi_uart/tx_return serdev_device_write_buf accepted=$retval:s64',
+    'p:pi_uart/tty_tx ttyport_write_buf requested=$arg3:u64',
+    'r:pi_uart/tty_tx_return ttyport_write_buf accepted=$retval:s64',
+    'p:pi_uart/rx hci_uart:hci_uart_receive_buf received=$arg3:u64',
+    'r:pi_uart/rx_return hci_uart:hci_uart_receive_buf accepted=$retval:u64',
+    'p:pi_uart/hardware_error bluetooth:hci_hardware_error_evt',
+]
+fd = os.open(root / 'kprobe_events', os.O_WRONLY)
+try:
+    for probe in probes:
+        os.write(fd, (probe + '\n').encode())
+finally:
+    os.close(fd)
+(inst / 'events/pi_uart/enable').write_text('1')
+(inst / 'events/pi_uart/hardware_error/trigger').write_text('traceoff:1')
+(inst / 'tracing_on').write_text('1')
+```
+
+Writes were paired with returns by task ID and interface name. Traces record lengths/results/timing, not the transmitted byte values or UART FIFO register contents. Trace freezing occurs when the kernel processes the error, not necessarily at the physical instant the fault begins.
+
+### Freeze/save watcher
+
+```bash
+#!/bin/bash
+set -eu
+trace=/sys/kernel/tracing/instances/pi_uart
+out=/home/us01/pi-gateway-diagnosis
+end=$((SECONDS + 3600))
+while [ "$(cat "$trace/tracing_on")" = 1 ] && [ "$SECONDS" -lt "$end" ]; do
+    sleep 1
+done
+printf 0 > "$trace/tracing_on"
+cat "$trace/trace" > "$out/uart-detail-trace.txt"
+cat /sys/kernel/tracing/kprobe_profile > "$out/uart-detail-probes.txt"
+cat "$trace"/per_cpu/cpu*/stats > "$out/uart-detail-buffer-stats.txt"
+journalctl -k -b --no-pager -o short-monotonic > "$out/uart-detail-kernel.txt"
+cat /proc/tty/driver/ttyAMA > "$out/uart-detail-counters.txt"
+printf 0 > "$trace/events/pi_uart/enable"
+systemctl stop pi-uart-btmon.service
+```
+
+### Headset-only audio test
+
+```bash
+#!/bin/bash
+set -u
+props='{ node.dont-fallback = true node.dont-reconnect = true }'
+pw-record --raw --target=bluez_input.84_0F_2A_DE_A0_D1.0 \
+    --properties="$props" --rate=16000 --channels=1 --format=s16 - >/dev/null &
+recorder=$!
+trap 'kill "$recorder" 2>/dev/null || true' EXIT
+trap 'exit 0' TERM INT
+while kill -0 "$recorder" 2>/dev/null; do
+    timeout 10 pw-play --volume=0.3 --properties="$props" \
+        --target=bluez_output.84_0F_2A_DE_A0_D1.1 \
+        /usr/share/sounds/alsa/Front_Center.wav || break
+    sleep 2
+done
+```
+
+These were launched using transient systemd units:
+
+```sh
+# Gateway stopped first; controller manually reset once; mSBC nodes verified.
+sudo python3 /tmp/pi-uart-trace-setup.py
+sudo systemd-run --unit=pi-uart-btmon --property=RuntimeMaxSec=3600 \
+    --property=StandardOutput=null /usr/bin/btmon -i hci0 \
+    -w /home/us01/pi-gateway-diagnosis/uart-detail.btsnoop
+sudo systemd-run --unit=pi-uart-trace-save --property=RuntimeMaxSec=3660 \
+    /bin/bash /tmp/pi-uart-trace-save.sh
+systemd-run --user --unit=pi-uart-audio-test --property=RuntimeMaxSec=3300 \
+    /bin/bash /tmp/pi-uart-audio-test.sh
+```
+
+The setup script ran before reconnecting the headset; playback started after the mSBC nodes appeared. Diagnostic services did not reset/recover Bluetooth. A single manual controller reset preceded each test. Kernel error handling itself still attempted HCI resets after failure.
+
+## 15. Production implementation and configuration
+
+The following appendices embed the repository contents so a reviewer does not need repository access. The gateway script's SHA-256 matched the installed Pi copy during inspection:
+
+```text
+13a46f091dcc80878a6d711651e5e718f66cc93efc6b0c9dd71ae2f55e4bc001
+```
+
+### Gateway Python script (`scripts/gateway.py`)
+
+```python
+#!/usr/bin/env python3
+"""Connect computer audio to the headset, and the headset mic to the computer."""
+import json
+import signal
+import subprocess
+import sys
+import time
+
+
+def run(*command):
+    # Failed commands stop the gateway; systemd starts it again.
+    result = subprocess.run(command, capture_output=True, text=True, timeout=8)
+    if result.returncode:
+        print(result.stderr.strip() or result.stdout.strip(), flush=True)
+        result.check_returncode()
+    return result.stdout
+
+
+def props(item):
+    # PipeWire stores device and node properties inside info.props.
+    return item.get("info", {}).get("props", {})
+
+
+def stop(process):
+    if process.poll() is not None:
+        return
+    process.send_signal(signal.SIGINT)
+    try:
+        process.wait(timeout=4)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
+def select_msbc(device):
+    # mSBC provides headset speakers and microphone at the same time.
+    params = device.get("info", {}).get("params", {})
+    for profile in params.get("EnumProfile", []):
+        if "mSBC" not in profile.get("description", ""):
+            continue
+        if profile.get("available") != "yes":
+            continue
+        for current in params.get("Profile", []):
+            if current.get("index") == profile["index"]:
+                return True
+        run("wpctl", "set-profile", str(device["id"]), str(profile["index"]))
+        # Changing profiles replaces the audio nodes. Read them next time.
+        return False
+    return False
+
+
+def stream(node, channels):
+    return json.dumps({
+        "target.object": props(node)["node.name"],
+        "node.dont-fallback": True,  # Never send audio to another device.
+        "audio.channels": channels,
+        "audio.position": "[ FL FR ]" if channels == 2 else "[ MONO ]",
+        "resample.quality": 10,
+        "channelmix.normalize": True,
+    })
+
+
+def bridge(previous, source, sink, channels=1):
+    # Each route remembers its nodes and the pw-loopback process joining them.
+    identity = None
+    if source is not None and sink is not None:
+        # A serial changes on reconnect, even if PipeWire reuses the node ID.
+        identity = [(node["id"], props(node).get("object.serial"))
+                    for node in (source, sink)]
+
+    if previous is not None:
+        old_identity, process = previous
+        if identity == old_identity and process.poll() is None:
+            return previous
+        stop(process)
+
+    if identity is None:
+        return None  # One end of the route is disconnected.
+
+    process = subprocess.Popen([
+        "pw-loopback", "--group", "pi_gateway", "--channels", str(channels),
+        "--channel-map", "[ FL FR ]" if channels == 2 else "[ MONO ]",
+        "--capture-props", stream(source, channels),
+        "--playback-props", stream(sink, 1),  # Both destinations are mono.
+    ], stdout=subprocess.DEVNULL)
+    return identity, process
+
+
+def main(address):
+    running = True
+    next_connect = 0
+    listen = microphone = None
+    last_status = None
+
+    def shutdown(signum, frame):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+    try:
+        while running:
+            objects = json.loads(run("pw-dump"))
+            device = None
+            usb = {}
+            headset = {}
+
+            # Find the USB nodes and this headset's device and mSBC nodes.
+            for item in objects:
+                properties = props(item)
+                is_headset = properties.get("api.bluez5.address") == address
+                if item["type"].endswith(":Device") and is_headset:
+                    device = item
+                elif item["type"].endswith(":Node"):
+                    usb[properties.get("node.name")] = item
+                    if is_headset and properties.get("api.bluez5.codec") == "msbc":
+                        headset[properties.get("media.class")] = item
+
+            # Keep trying a paired headset every 15 seconds while it is absent.
+            if device is None and time.monotonic() >= next_connect:
+                next_connect = time.monotonic() + 15
+                try:
+                    run("bluetoothctl", "--timeout", "3", "connect", address)
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                    print("Headset unavailable; will retry.", flush=True)
+
+            if device is None or not select_msbc(device):
+                headset = {}
+
+            # Computer stereo → headset mono; headset mic → computer mono.
+            listen = bridge(listen, usb.get("pi_gateway_host_audio"),
+                            headset.get("Audio/Sink"), channels=2)
+            microphone = bridge(microphone, headset.get("Audio/Source"),
+                                usb.get("pi_gateway_usb_microphone"))
+            status = (listen is not None, microphone is not None)
+            if status != last_status:
+                print(f"Host → headset: {status[0]}; headset → host: {status[1]}", flush=True)
+                last_status = status
+            time.sleep(1)
+    finally:
+        # Do not leave audio processes running after the gateway stops.
+        for route in (listen, microphone):
+            if route is not None:
+                stop(route[1])
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        sys.exit("Usage: gateway.py HEADSET_ADDRESS")
+    main(sys.argv[1])
+```
+
+### WirePlumber configuration (`config/wireplumber/50-pi-audio-gateway.conf`)
+
+```ini
+# WirePlumber 0.5: keep Bluetooth audio available without a desktop login.
+wireplumber.profiles = {
+  main = {
+    monitor.bluez.seat-monitoring = disabled
+    monitor.bluez-midi = disabled
+    hardware.video-capture = disabled
+  }
+}
+
+monitor.bluez.properties = {
+  # The Pi acts as the hands-free audio gateway for the headset.
+  bluez5.roles = [ hfp_ag ]
+  bluez5.hfphsp-backend = "native"
+  bluez5.enable-msbc = true
+}
+
+# The gateway explicitly selects the mSBC duplex profile.
+wireplumber.settings = {
+  bluetooth.autoswitch-to-headset-profile = false
+}
+
+monitor.alsa.rules = [
+  # USB capture: audio arriving from the computer.
+  {
+    matches = [ { alsa.card_name = "UAC2_Gadget" media.class = "Audio/Source" } ]
+    actions = { update-props = {
+      node.name = "pi_gateway_host_audio"
+      node.description = "Host audio for gateway"
+      # This source drives host playback independently of the microphone route.
+      priority.driver = 1900
+      # Extra USB buffering absorbs packet timing and scheduling jitter.
+      api.alsa.period-size = 256
+      api.alsa.headroom = 1024
+      session.suspend-timeout-seconds = 0
+      resample.quality = 10
+    } }
+  }
+  # USB playback: microphone audio going back to the computer.
+  {
+    matches = [ { alsa.card_name = "UAC2_Gadget" media.class = "Audio/Sink" } ]
+    actions = { update-props = {
+      node.name = "pi_gateway_usb_microphone"
+      node.description = "Microphone to USB host"
+      # Absorb USB timing jitter in the microphone route.
+      api.alsa.period-size = 256
+      api.alsa.headroom = 1024
+      session.suspend-timeout-seconds = 0
+      resample.quality = 10
+    } }
+  }
+]
+```
+
+### Gateway user service (`config/systemd/pi-audio-gateway.service`)
+
+```ini
+[Unit]
+Description=Pi Audio Gateway mSBC duplex bridge
+After=pipewire.service wireplumber.service
+Requires=pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+# Set the paired headset's Bluetooth address here. %h is the user's home folder.
+ExecStart=/usr/bin/python3 %h/pi-audio-gateway/scripts/gateway.py 84:0F:2A:DE:A0:D1
+# Recover if an audio command fails or PipeWire restarts.
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+UMask=0077
+
+[Install]
+WantedBy=default.target
+```
+
+### USB gadget system service (`config/systemd/pi-audio-usb.service`)
+
+```ini
+[Unit]
+Description=Pi Audio Gateway USB audio device
+After=systemd-modules-load.service
+Before=sound.target
+
+[Service]
+Type=oneshot
+# The kernel keeps the USB device active after the setup script exits.
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/pi-audio-usb start
+ExecStop=/usr/local/sbin/pi-audio-usb stop
+TimeoutStartSec=20
+
+[Install]
+WantedBy=multi-user.target
+```
+
