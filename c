@@ -1,6 +1,6 @@
 # Pi Audio Gateway: Bluetooth controller failure investigation
 
-Prepared and updated 2026-09-26, including the evening two-Pi comparison. All wall-clock times below are IST (UTC+05:30), unless explicitly marked otherwise.
+Prepared and updated 2026-09-26 through the 22:46 inspection, including the different-headset and Wi-Fi-driver-unbound tests. All wall-clock times below are IST (UTC+05:30), unless explicitly marked otherwise.
 
 This is a self-contained handoff for a new investigating agent. Relevant implementation and diagnostic scripts are included below. **This copy contains SSH credentials at the user’s request.** Raw Bluetooth captures remain on their respective Pis; this document contains their measured results, not audio payloads.
 
@@ -13,6 +13,8 @@ The user wants a reliable USB-to-Bluetooth audio gateway with simultaneous heads
 Temporary kernel probes showed complete acceptance of writes by the Linux Bluetooth-to-serial and serial-to-TTY interfaces immediately before failures. This rules out observed short writes at those interfaces in the captured windows. It does **not** prove that the UART hardware transmitted every byte correctly or that the controller received/processed every byte correctly.
 
 The two core dumps have saved program counters four bytes apart and identical saved LR/SP values. This strongly suggests related firmware failure paths, but does not identify the trigger or prove all earlier Hardware Error events share that cause. UART transport, firmware/radio coexistence, scheduling, and headset-model interoperability remain possibilities. USB activity is not necessary for the no-USB reproduction; physically defective hardware has not been diagnosed.
+
+**Latest result: disabling Wi-Fi did NOT prevent failure.** On `rpiz2`, a different headset model (OnePlus Nord Buds 3 Pro) reproduced Hardware Error `0x00` and unanswered Resets with both USB and Wi-Fi drivers detached. Wi-Fi detachment was verified in a local log at 21:49:08; Bluetooth failed at 22:11:02; scheduled Wi-Fi restoration occurred at 22:33:45–22:33:48. This establishes that the Bullets Wireless Z2 model and concurrent host Wi-Fi activity are not necessary for this Hardware Error signature. It does not prove the precise firmware/UART defect, exclude every RF/power/shared-chip influence, or establish that the G/H core dumps have the same trigger. No verified permanent fix has been found. See sections 6L–6M.
 
 ## 2. User preferences and boundaries
 
@@ -41,7 +43,6 @@ ssh us02@rpiz2.local
 ssh us02@192.168.1.12
 ```
 
-Password for both SSH accounts: `alaska09`. The same password was used when sudo requested authentication. Use it at the password prompt; avoid including it in command logs or diagnostic output.
 
 Both Pis were reachable during the 20:29 inspection. Addresses are last-known LAN addresses, not guarantees for a later session. The original Pi was reached by hostname and the second by IPv4. Check current uptime, services, and controller state before making assumptions from the historical test states. The local workspace is `/Users/us01/Documents/ChatGPT/Pi Audio Gateway`; its `AGENTS.md` requires a short approved plan before code/configuration changes.
 
@@ -88,7 +89,7 @@ LMP Version: 4.2 (0x8)  Subversion: 0x410c
 Manufacturer: Broadcom Corporation (15)
 ```
 
-Wi-Fi remained enabled throughout the completed tests. It was connected on 2472 MHz (2.4 GHz), with power saving enabled and a sampled signal around -57 dBm. Wi-Fi-off and Wi-Fi-power-save-off comparisons have **not** been performed.
+Wi-Fi remained enabled through tests A–L. Earlier samples showed 2472 MHz (2.4 GHz), power saving enabled, and signal around -57 dBm on the original Pi. Test M detached the second Pi's Wi-Fi driver and still reproduced failure; a separate power-save-only comparison has not been performed.
 
 ### Verified two-device software and firmware comparison
 
@@ -451,9 +452,9 @@ The user supplied screenshots of a consultant's analysis and subsequent correcti
 - `ttyport_write_buf` directly returns the TTY write result (`uart_write` in this path). Another return-length probe at `uart_write` would largely duplicate the existing measurement. The current probes do not observe bytes leaving the hardware FIFO.
 - `SCO MTU 64:1` does not prove SCO credit flow control is enabled. Linux `hci_sched_sco()` has a no-flow-control path that reschedules without Number Of Completed Packets events. Even observed completion events would not prove an incoming audio gap was exclusively over the air.
 - A controller reassembly timeout triggered by a long intra-packet UART pause is an unverified firmware hypothesis. PL011 handler timestamps alone would not directly measure wire gaps; pending data, bytes written, FIFO state, and flow control affect interpretation.
-- Source inspection suggests the Broadcom driver's host-controlled sleep setup depends on a successful wake IRQ request; the board source adds only a shutdown GPIO. This deprioritizes that specific mechanism, subject to running configuration. It does not exclude all controller power behavior. Complete initialization capture should be checked for `0xFC27`; that check has not yet been reported for G/H.
+- Source inspection suggests the Broadcom driver's host-controlled sleep setup depends on a successful wake IRQ request; the board source adds only a shutdown GPIO. This deprioritizes that specific mechanism, subject to running configuration. It does not exclude all controller power behavior. The later G/H initialization review found no `0xFC27` command (section 6K).
 - The source speed quirk mentioning BCM43430 A0/A1 must not be assumed to apply to this B0 firmware. Effective DMA use, physical UART accessibility, and transient RTS/CTS behavior should not be declared settled from one source file or one pin snapshot.
-- Wi-Fi load, Wi-Fi disablement, and driver removal change more than radio contention. An A2DP success would not eliminate every UART fault. Neither an A2DP soak nor controlled Wi-Fi comparisons have been performed.
+- Wi-Fi load, Wi-Fi disablement, and driver removal change more than radio contention. An A2DP success would not eliminate every UART fault. No A2DP soak has been performed. The later Wi-Fi-driver-unbound comparison is completed in section 6M; it did not prevent the Hardware Error failure.
 - Failure times vary widely. Repeated comparable runs are needed to estimate changes in reliability; no repeat-to-failure harness or statistically controlled baseline has been built. The 1 Mbaud failure proves that setting did not prevent failure in that run, not that it cannot change the failure rate.
 
 #### Later consultant screenshot and its limits
@@ -464,8 +465,66 @@ The screenshot supplied around 20:27 correctly emphasized obtaining actual packa
 - The outgoing-SCO and credit analysis is **completed**, not pending (section 6F). The later core-dump signature also differs from the earlier Hardware Error/Reset-timeout signature; both are documented rather than reduced to “audio stopped.”
 - Reproduction on separate units makes a fault unique to one board, headset, or cable a weaker explanation. It does not logically rule out every hardware, shared-design, power, storage, or configuration problem. SD-card/filesystem health was not measured, and distinct power sources were not confirmed.
 - The two kernels rule against a cause exclusive to Trixie/6.18 for both core dumps. They do not prove that every OS/kernel contribution is excluded or that all future kernel comparisons are worthless.
-- Identical headset model does not by itself verify identical negotiated eSCO parameters. A different headset model, controlled Wi-Fi activity, different RF conditions, compatible firmware comparison, or CVSD comparison remains an unperformed proposal. The user's earlier decision against CVSD was not overridden by a consultant suggestion.
+- Identical headset model does not by itself verify identical negotiated eSCO parameters; the later capture review established matching reported parameters for C/D/E/G/H (section 6K). Different-headset and Wi-Fi-driver-unbound tests are now completed (6L–6M). Controlled Wi-Fi traffic, different RF conditions, compatible firmware, and CVSD comparisons remain unperformed. The user's earlier decision against CVSD was not overridden by a consultant suggestion.
 - Firmware matching is now evidence, not “almost certainly identical.” Matching firmware plus similar saved execution state prioritizes investigation; it does not make the consultant's remaining-suspect list exhaustive or identify the root cause.
+
+### K. Later read-only review of existing captures
+
+- G/H last incoming SCO → first dump intervals are **1.997662 s / 2.000837 s**. First → last dump durations are **62.079325 s / 62.079112 s**. Neither last-SCO-to-first-dump gap contains an intervening HCI command/event or ACL packet; outgoing SCO submissions continued (266 / 267 packets). Relevant disconnect and synchronous-link-change events were enabled in both event masks. The timing suggests repeatable failure handling, not proof that a radio disconnection caused a later crash or identical instruction-by-instruction execution.
+- C/D/E/G/H report matching eSCO parameters: transmission interval `0x0C` (7.5 ms), retransmission window `0x04`, 60-byte RX/TX packets, transparent air mode. G/H initialization includes neither `0x0C2F` (Write Synchronous Flow Control Enable) nor `0xFC27`. The consultant's suggested `0x0C7F` was the wrong opcode.
+- Outgoing intervals below 1 ms occurred during successful operation as well as the final ten seconds of incoming audio: G **2.824% / 2.851%**, H **2.850% / 3.003%**. H's earlier portion also includes the failed setup attempt. These measurements do not establish controller buffer overruns or a new burst pattern at failure.
+- Both dumps contain 707 memory records covering the same two regions in 6I, totaling 163,840 bytes. PC/LR/R0 addresses are outside those regions. Dump coverage alone does not prove ROM placement or an invalid pointer, and does not justify declaring firmware patches ineffective.
+
+### L. Different headset: OnePlus Nord Buds 3 Pro, USB unbound
+
+The user approved a different-model mSBC comparison on `rpiz2`. **OnePlus Nord Buds 3 Pro**, address `08:12:87:1A:8F:69`, were paired/trusted and connected. The gateway was stopped; the USB gadget service was stopped and DWC2 unbound. Wi-Fi remained enabled. Capture started before one Bluetooth driver unbind/rebind. The existing headset-only script was copied with only the headset address changed: repeated `Front_Center.wav` playback at 0.3 volume and continuous 16 kHz mono microphone capture to `/dev/null`, with fallback and reconnection disabled.
+
+| Measurement | Result |
+|---|---|
+| Audio service start | 21:15:21.391747 |
+| First outgoing SCO | 21:15:22.127863 |
+| First Hardware Error `0x00` | **21:35:54.663423** |
+| First SCO → error | **1232.535560 s (20 min 32.536 s)** |
+| Last incoming SCO before error | 21:35:54.662463; gap **960 µs** |
+| Last outgoing SCO before error | 21:35:54.662239; gap **1184 µs** |
+| Hardware Error events in final capture | 94; 28 in first 10 ms |
+| Post-error Reset commands / completions | **66 / 0** |
+| Post-error outgoing / incoming SCO | 2 / 17,659 |
+| Last incoming SCO | 21:38:08.818831 |
+| Vendor core-dump events | **0** |
+
+Negotiated eSCO parameters were interval `0x0C`, retransmission window **`0x06`**, 60-byte RX/TX, transparent mode. Thus the new headset did not negotiate exactly the same retransmission window as the Z2. No HCI commands/events appeared in the two seconds before the first error. The audio script exited with `stream node 4294967295 unconnected`. Capture/logging were stopped after saving state around 21:38; sequential parsing found no invalid tail. Incoming packets after failure are not proof of valid live microphone audio.
+
+**Result:** the Hardware Error/Reset-timeout signature is not exclusive to the Z2 model and reproduces with USB unbound. This run did not reproduce the G/H core-dump signature. No investigator-issued recovery reset followed this failure; the single reset for the next approved test was later.
+
+### M. Same Nord Buds with Wi-Fi and USB drivers detached
+
+The user approved the Wi-Fi-off comparison. The same `rpiz2`, Nord Buds, mSBC audio script, and USB-unbound setup were retained. Bluetooth was reset once before the run, with capture already active. Both audio directions and zero new Hardware Error/core-dump events were verified before Wi-Fi detachment. No boot configuration, packages, or production gateway code were changed.
+
+Wi-Fi was disabled by unbinding **both `mmc1:0001:1` and `mmc1:0001:2` from `brcmfmac`**, in that order. The local script verified that `wlan0` and both driver symlinks were absent and wrote `WIFI_DRIVER_UNBOUND`. This was driver detachment, not merely disconnecting from the AP or changing Wi-Fi power saving. A separately scheduled system timer was verified before detachment; it reattached both functions and reconnected the existing NetworkManager profile. SSH was unavailable during the interval; diagnostics continued locally.
+
+| Measurement | Result |
+|---|---|
+| Audio service start | 21:48:15.961202 |
+| First outgoing SCO | 21:48:16.901058 |
+| Wi-Fi unbind started / verified complete | **21:49:07.973369 / 21:49:08.655438** |
+| First Hardware Error `0x00` | **22:11:02.202070** |
+| First SCO → error | **1365.301012 s (22 min 45.301 s)** |
+| Verified Wi-Fi detachment → error | **21 min 53.547 s** |
+| Last incoming SCO before error | 22:11:01.893733; gap **308.337 ms** |
+| Last outgoing SCO before error | 22:11:02.200697; gap **1.373 ms** |
+| New Hardware Error events | **39**, all within 1.684 ms |
+| Post-error Reset commands / completions | **2 / 0** |
+| Post-error outgoing / incoming SCO | 2 / 555 |
+| Last incoming SCO | 22:11:06.378398 |
+| Vendor core-dump events | **0** |
+| Scheduled restoration started / finished | **22:33:45.278671 / 22:33:47.980592** |
+
+The negotiated parameters match L, including retransmission window `0x06`. No HCI commands/events appeared in the two seconds before the first error. The user reported stopped audio around 22:12, well before the scheduled cutoff. The script had already exited with `stream node 4294967295 unconnected`; the restoration log's “audio.service not loaded” message reflects that prior exit, not failure to restore Wi-Fi. NetworkManager confirmed successful reconnection.
+
+The capture began while the previous failure state still existed, before the manual reset. **Filter failure counts from `audio-start.txt`; do not count pre-test errors as this run's failure.** Sequential parsing of the final capture found no invalid tail. Capture and kernel logging ended at their configured 3300-second limits (22:41:32 / 22:42:14); systemd reports `Result=timeout` for these intended limits, not a premature recorder crash. The kernel log records Wi-Fi reinitialization only at the scheduled restoration, after Bluetooth had failed. Uptime at 22:46 confirms no reboot during this run.
+
+**Result: disabling Wi-Fi did not prevent the Hardware Error/Reset-timeout failure.** Concurrent host Wi-Fi activity and USB controller activity are not necessary for this reproduction. This does not exclude every shared-chip, RF-environment, power, host scheduling, firmware, or UART mechanism. The 20.5- versus 22.8-minute single-run durations do not establish a reliability improvement. No verified permanent fix or exact initiating defect has been identified; do not present Wi-Fi disablement as the cure or declare that G/H and L/M necessarily share one cause.
 
 ## 7. Other measurements and their limits
 
@@ -489,7 +548,7 @@ Unless explicitly updated below, these measurements refer to the original Pi bef
 - WirePlumber sometimes logged `spa.bluez5.source.sco: decode failed: -3`, including before failures. The exact meaning/cause was not established. Incoming HCI SCO packet status bits in the examined pre-failure captures were all 0; that does not guarantee successful mSBC decoding.
 - Outgoing HCI SCO packet lengths in the examined captures were consistently 63 bytes, declaring 60 payload bytes. No malformed length fields were observed.
 - No actual physical UART TX bytes or controller-side FIFO contents have been measured. Later tests G/H captured internal firmware core-dump data; earlier tests A–E did not.
-- Wi-Fi stayed enabled; its coexistence/power-save involvement remains untested.
+- Wi-Fi stayed enabled in the earlier tests; section 6M now demonstrates failure with its driver detached. A power-save-only comparison remains unperformed.
 
 ## 8. What the evidence supports—and does not
 
@@ -502,6 +561,7 @@ Unless explicitly updated below, these measurements refer to the original Pi bef
 5. The traced Linux software interfaces accepted all paired writes in the captured windows; no short-write error was found there.
 6. A second board and separate same-model headset reproduced a closely matching controller core dump under Bookworm with USB unbound. Neither the first physical unit nor USB activity is necessary for that signature.
 7. Controller core-dump emission is established; the exact firmware fault and its trigger are not.
+8. A different headset model (Nord Buds 3 Pro) reproduced the Hardware Error signature on `rpiz2` with USB unbound, both with Wi-Fi enabled (L) and with the Wi-Fi driver detached (M). Wi-Fi disablement did not fix the failure.
 
 **Not established:**
 
@@ -514,7 +574,9 @@ Do not equate the generic “hardware error” label with a proven physical hard
 
 ## 9. State at handoff
 
-**Latest read-only inspection, 20:29 IST:** both Pis are reachable; both gateway services and both USB gadget services are active; both DWC2 controllers are bound. These observations supersede earlier current-state assumptions below. Neither Pi was modified during that inspection. The following subsections preserve the end-of-test states so the historical experiments are not confused with later boot/service activity.
+**Latest inspection of `rpiz2`, 22:46 IST:** reachable over restored Wi-Fi; gateway and USB gadget services inactive; DWC2 still unbound and `/sys/class/udc` empty. The test audio and diagnostic recorders are stopped. Bluetooth was left after the failure with no post-M recovery reset. The Nord Buds remain paired/trusted. No boot enablement, firmware, kernel, or production gateway code was changed by these tests. Read current state before new work.
+
+The original Pi was not retested in L/M; its gateway/USB services were last verified active at 20:53. The 20:29 two-Pi snapshot found both DWC2 controllers bound. Those earlier observations are historical, not the latest state of `rpiz2`. The subsections below preserve earlier end-of-test states.
 
 ### Original Pi (`rpiz`), state at the end of G (historical)
 
@@ -541,20 +603,25 @@ Do not equate the generic “hardware error” label with a proven physical hard
 1. Can matching BCM43430B0/build-0092 symbols identify PC `0x6B0DA` / `0x6B0D6` and LR `0x2B229`, or decode the exception record? What evidence distinguishes the trigger from the crash location?
 2. Are there relevant BCM43430B0/build-0092 or Raspberry Pi PL011/serdev issues that match these specific observations? Please distinguish a matching report from a proven cause.
 3. Are the core dumps G/H and earlier Hardware Error failures one mechanism or distinct failures? How does successful Reset recovery in D constrain the explanation?
-4. What minimal controlled comparison separates Wi-Fi-related host load, radio coexistence, firmware, and headset-model interoperability, given reproduction on a second board with USB unbound?
+4. What minimal discriminating measurement now separates firmware, UART transport, and remaining host/shared-chip influences, given the Nord Buds Hardware Error reproduction with both USB and Wi-Fi drivers detached (6M)?
 5. Are the repeated bursts of 14/31/39 error events and the pre-error RX gaps meaningful, or potentially artifacts of transport/driver buffering?
 
 Please avoid proposing only recovery scripts, indiscriminate configuration changes, or declaring the cause solved without a discriminating measurement.
 
 ### Recommended next steps for the new agent
 
+**For Agent 2 review:** the proposed priority is (1) matching firmware/ROM information and saved-dump analysis, (2) research of a genuinely different, compatible Bluetooth firmware candidate, then (3) investigation of the UART/controller boundary if firmware evidence remains unavailable. The immediate work is read-only research and analysis of existing evidence, not another headset or Wi-Fi test. These are proposals for review, not authorization to execute live experiments. The exact initiating defect and a permanent fix remain unproven.
+
 **Prioritize the common controller firmware failure path.** Two physical setups with different kernels/userspace produced closely matching core dumps, and the installed Bluetooth firmware hashes are identical. This prioritizes firmware investigation; it does not establish whether the trigger is internal firmware logic, headset-model interoperability, Wi-Fi coexistence, or host transport behavior. No proposed experiment below has been carried out or approved merely by its inclusion here.
 
-1. **Begin with read-only evidence review.** Check current device state, preserve the existing captures, and use the valid prefix of the second-Pi file. Review sections 3 and 6F–6J before repeating completed work. The 20:29 snapshot found gateway and USB services active on both Pis; neither is currently guaranteed to be in an isolated-test state.
+1. **Begin with read-only evidence review.** Check current device state, preserve the existing captures, and use the valid prefix of H's damaged file. Review sections 3 and 6F–6M before repeating completed work. At 22:46, `rpiz2` had Wi-Fi restored, gateway stopped, USB unbound, and Bluetooth left failed. Do not assume the original Pi has the same state.
 2. **Identify the crash location using matching firmware information.** Look for symbols, a ROM map, or authoritative dump-format information for this BCM43430B0/build-0092 variant. Map PCs `0x6B0DA` and `0x6B0D6`, LR `0x2B229`, and decode the exception/register record. Do not silently apply another chip revision's symbol map or infer a faulting source function from address proximity alone. The dump checksum variant is not fully resolved.
 3. **Research a compatible alternative Bluetooth firmware before proposing a firmware A/B.** Confirm the exact chip/board/reference-clock compatibility and provenance; a differently named package containing the same hash is not a comparison. Present the candidate, hashes, minimal substitution method, and rollback plan for approval before changing firmware. Preserve the original board-specific symlink and target. If no credible compatible alternative exists, report that limit instead of trying arbitrary `.hcd` files.
-4. **If a firmware comparison is unavailable, propose a different headset model using mSBC.** Both current headsets are separate units of the same model. Retain the USB-unbound direct-audio setup and change one intended variable. Check availability with the user before planning this test. The earlier CVSD comparison was declined; do not run it without a new explicit decision.
-5. **Investigate Wi-Fi as a trigger with a controlled comparison.** Both boards use the same observed Wi-Fi firmware version, AP/channel, and power-save setting. Separate network traffic from host workload as far as practical; SSH/`htop` timing alone does not isolate RF coexistence. Before proposing Wi-Fi disablement, provide a concrete way to retain or restore access because SSH currently uses Wi-Fi. Do not claim a radio-only experiment when host driver/interrupt load also changes.
+4. **If firmware evidence remains unavailable, investigate the UART/controller boundary.** Existing probes show that Linux accepted writes, not which bytes physically reached the controller. Propose the smallest measurement that can distinguish transport corruption, timing/flow-control behavior, and controller command-processing failure. Explain what each possible result would establish before adding instrumentation; do not repeat return-length probes that merely duplicate completed checks.
+5. **Do not treat a different headset model as an unperformed first test.** The Nord Buds comparison is complete and failed with the Hardware Error signature (L/M). Its retransmission window differs from the Z2's, while C/D/E/G/H share the recorded parameters in K. Any further interoperability experiment should explain what new distinction it tests. The earlier CVSD comparison was declined; do not run it without a new explicit decision.
+6. **Do not propose Wi-Fi disablement as an established fix or missing first test.** M failed while both Wi-Fi SDIO functions were detached and USB remained unbound. Review that evidence before proposing further radio/power/scheduling changes. Driver removal changes more than radio contention; neither its failure nor the G SSH correlation proves a specific root cause. No verified patch for this exact failure has been identified.
+
+**Approval boundary:** present a concrete plan and obtain user approval before issuing live controller ROM-read/vendor commands, substituting firmware, or changing drivers/code/configuration. A vendor command described as a “read” still interacts with the live controller; it is not equivalent to offline analysis. Agent 2 should review the priority order, identify unsupported assumptions, and recommend a discriminating next measurement without treating this handoff as permission to run it.
 
 For any approved repeat: capture from before controller initialization, disable audio fallback, record actual stream start time, and retain both standard Hardware Error events and vendor `1B 03` dumps. A Hardware-Error-only watcher misses the latter; allow more than the observed ~62-second dump transmission before stopping capture after a dump starts. Preserve captures before reboot and, where practical, save logs to files rather than relying on the unavailable previous-boot journal. Keep kernel/firmware/profile settings documented and compare repeated runs rather than treating one survival time as a fix.
 
@@ -606,10 +673,14 @@ New test evidence:
 |---|---|---|
 | `rpiz` | `/home/us01/pi-gateway-diagnosis/repeat-20260926-180614/` | `capture.btsnoop`, `kernel.txt`, `bluetooth.txt`, `ssh.txt`, `manual-stop.txt`, `watch.py` |
 | `rpiz2` | `/home/us02/pi-gateway-diagnosis/msbc-no-usb-20260926-200649/` | `capture.btsnoop`, `kernel-setup.txt`, `audio.sh`, `audio-start.txt` |
+| `rpiz2` | `/home/us02/pi-gateway-diagnosis/nord-buds-20260926-211332/` | L: `capture.btsnoop`, `kernel.txt`, `audio.sh`, `audio-start.txt`, `audio.txt`, `setup.txt`, `analysis.txt`, `failure-state.txt`, `failure-pw-dump.json` |
+| `rpiz2` | `/home/us02/pi-gateway-diagnosis/nord-wifi-off-20260926-214621/` | M: `capture.btsnoop`, `kernel.txt`, `audio.sh`, `audio-start.txt`, `audio.txt`, `setup.txt`, `analysis.txt`, `failure-state.txt`, `disable-wifi.sh`, `restore-wifi.sh`, `wifi-off.txt`, `wifi-restore.txt`, `restore-timer.txt` |
 
 The original Pi's `repeat-current.txt` and the second Pi's `test-current.txt` point to these respective directories. The original-Pi watcher's expected `first-error.txt` and `capture-stopped.txt` were absent because no Hardware Error triggered it. The second-Pi capture includes the failed `--raw` setup attempt and the later corrected test; use `audio-start.txt` to distinguish them. The second-Pi capture's invalid tail must be excluded during parsing.
 
 Raw `.btsnoop` captures can contain audio payloads. They were analysed on their respective Pis and were not copied to the Mac or embedded here. This handoff does not require reviewers to obtain those files to understand the stated findings.
+
+The second Pi's `nord-buds-current.txt` and `nord-wifi-off-current.txt` point to L and M respectively. Both final files parsed without an invalid tail and were synced to storage. In M, read `wifi-off.txt` and `wifi-restore.txt` to verify the offline interval, and filter errors from `audio-start.txt` onward. Transient unit names were `pi-nord-audio`, `pi-nord-btmon`, `pi-nord-kernel-log` for L, and `pi-wifi-off-audio`, `pi-wifi-off-btmon`, `pi-wifi-off-kernel-log`, `pi-disable-wifi`, `pi-wifi-restore.timer` / `.service` for M. Audio units are user services; capture, logging, and Wi-Fi control units are system services. The Wi-Fi timer restored networking only; it did not reset Bluetooth or restart the gateway.
 
 ## 13. Relevant boot and reset details
 
@@ -636,7 +707,7 @@ timeout 12 bluetoothctl connect 84:0F:2A:DE:A0:D1
 
 ## 14. Diagnostic implementation
 
-These are the temporary scripts used in the last two tests. They are included as evidence of exactly what was measured, not as instructions to execute blindly on another machine. The trace setup is not idempotent if its previous probes still exist.
+These are the temporary scripts used in tests D/E. They are included as evidence of exactly what was measured, not as instructions to execute blindly on another machine. The trace setup is not idempotent if its previous probes still exist. The later L/M scripts and Wi-Fi restoration logs are preserved at the paths in section 12.
 
 The scripts below describe the original tests D/E, not every subsequent capture. G used `btmon` plus a Hardware-Error-only journal watcher; H used `btmon` without that watcher. H used the separate headset address and omitted the unsupported `pw-record --raw` option. G/H had no kprobes and saved captures directly on their respective Pis.
 
@@ -990,4 +1061,3 @@ TimeoutStartSec=20
 [Install]
 WantedBy=multi-user.target
 ```
-
